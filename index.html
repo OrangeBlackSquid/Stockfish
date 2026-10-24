@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stockfish Chess – Simple</title>
+  <link rel="stylesheet"
+        href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      background: #f8f9fa;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      min-height: 100vh; margin: 0; padding: 20px; color: #212529;
+    }
+    h1 { font-weight: 400; font-size: 1.6rem; margin-bottom: 20px; }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 20px;
+      align-items: center; justify-content: center;
+      margin-bottom: 20px; background: #fff;
+      padding: 15px 25px; border-radius: 8px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+    }
+    .controls label {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 0.95rem; cursor: pointer;
+    }
+    .controls select, .controls button {
+      font-size: 0.95rem; padding: 6px 12px;
+      border: 1px solid #ced4da; border-radius: 4px;
+      background: #fff; cursor: pointer;
+    }
+    .controls button {
+      background: #e9ecef; border-color: #dee2e6; transition: background 0.2s;
+    }
+    .controls button:hover { background: #dee2e6; }
+    #board {
+      width: 400px; max-width: 90vw; margin: 0 auto; position: relative;
+    }
+    .highlight-best {
+      box-shadow: inset 0 0 3px 3px #3b82f6 !important;
+    }
+    #arrow-overlay {
+      position: absolute; top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none; z-index: 10;
+    }
+    #status {
+      margin-top: 12px; font-size: 0.85rem; color: #6c757d;
+      min-height: 1.2em; font-family: ui-monospace, monospace;
+    }
+  </style>
+</head>
+<body>
+  <h1>Stockfish Chess</h1>
+
+  <div class="controls">
+    <label>
+      Start as:
+      <select id="start-side">
+        <option value="white" selected>White</option>
+        <option value="black">Black</option>
+      </select>
+    </label>
+    <label>
+      <input type="checkbox" id="stockfish-toggle" checked>
+      Stockfish ON
+    </label>
+    <button id="reset-btn" type="button">New Game</button>
+  </div>
+
+  <div id="board"></div>
+  <div id="status"></div>
+
+  <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+
+  <script>
+    (function () {
+      'use strict';
+
+      // ---- DOM ----
+      const boardEl        = document.getElementById('board');
+      const startSideSelect = document.getElementById('start-side');
+      const stockfishToggle = document.getElementById('stockfish-toggle');
+      const resetBtn       = document.getElementById('reset-btn');
+      const statusEl       = document.getElementById('status');
+
+      // ---- State ----
+      let board = null;
+      let game  = new Chess();
+      let stockfish = null;
+      let stockfishReady = false;
+      let stockfishEnabled = true;
+      let bestMove = null;
+      let arrowOverlay = null;
+      let engineTimeoutId = null;
+      const arrowMarkerId = 'arrowhead';
+
+      // ---- Logging helper (writes to status line + console) ----
+      function log(msg, isError) {
+        if (statusEl) {
+          statusEl.textContent = msg;
+          statusEl.style.color = isError ? '#dc3545' : '#6c757d';
+        }
+        if (isError) console.error('[chess]', msg); else console.log('[chess]', msg);
+      }
+
+      // ==================================================================
+      //  STOCKFISH
+      // ==================================================================
+      function initStockfish() {
+        if (stockfish) return;
+        const engineUrl =
+          'https://cdn.jsdelivr.net/npm/stockfish@19.0.1/stockfish-19-lite-single.js';
+        try {
+          stockfish = new Worker(engineUrl);
+        } catch (err) {
+          stockfishReady = false;
+          log('Stockfish failed to start: ' + err.message, true);
+          return;
+        }
+        stockfish.onmessage = onStockfishMessage;
+        stockfish.onerror = function (e) {
+          log('Stockfish worker error: ' + (e.message || 'unknown'), true);
+        };
+        stockfish.postMessage('uci');
+        stockfish.postMessage('isready');
+        stockfish.postMessage('ucinewgame');
+        stockfishReady = true;
+        log('Stockfish ready.');
+      }
+
+      function stopStockfish() {
+        if (engineTimeoutId) {
+          clearTimeout(engineTimeoutId);
+          engineTimeoutId = null;
+        }
+        if (stockfish) {
+          try { stockfish.terminate(); } catch (e) { /* ignore */ }
+          stockfish = null;
+        }
+        stockfishReady = false;
+      }
+
+      function onStockfishMessage(e) {
+        const line = e.data;
+        if (typeof line !== 'string') return;
+        if (line.startsWith('bestmove')) {
+          const parts = line.split(' ');
+          const moveStr = parts[1];
+          if (moveStr && moveStr !== '(none)') {
+            bestMove = { from: moveStr.slice(0, 2), to: moveStr.slice(2, 4) };
+            highlightBestMove(bestMove.from, bestMove.to);
+          }
+        }
+      }
+
+      function requestBestMove() {
+        if (!stockfishEnabled || !stockfish || !stockfishReady) return;
+        clearBestMoveHighlight();
+        try {
+          stockfish.postMessage('position fen ' + game.fen());
+          stockfish.postMessage('go depth 12');
+        } catch (err) {
+          log('Stockfish request failed: ' + err.message, true);
+        }
+      }
+
+      function scheduleEngineMove(delay) {
+        if (engineTimeoutId) clearTimeout(engineTimeoutId);
+        engineTimeoutId = setTimeout(function () {
+          engineTimeoutId = null;
+          requestBestMove();
+        }, delay || 100);
+      }
+
+      // ==================================================================
+      //  HIGHLIGHT + ARROW
+      // ==================================================================
+      function highlightBestMove(from, to) {
+        clearBestMoveHighlight();
+        const fromSquare = document.querySelector('.square-' + from);
+        const toSquare   = document.querySelector('.square-' + to);
+        if (fromSquare) fromSquare.classList.add('highlight-best');
+        if (toSquare)   toSquare.classList.add('highlight-best');
+        drawArrow(from, to);
+      }
+
+      function clearBestMoveHighlight() {
+        document.querySelectorAll('.highlight-best').forEach(function (el) {
+          el.classList.remove('highlight-best');
+        });
+        if (arrowOverlay) {
+          arrowOverlay.querySelectorAll('line').forEach(function (l) { l.remove(); });
+        }
+      }
+
+      function ensureArrowOverlay() {
+        if (arrowOverlay) return;
+        arrowOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        arrowOverlay.id = 'arrow-overlay';
+        arrowOverlay.setAttribute('viewBox', '0 0 8 8');
+        arrowOverlay.setAttribute('preserveAspectRatio', 'none');
+        const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+        const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+        marker.setAttribute('id', arrowMarkerId);
+        marker.setAttribute('markerWidth', '4');
+        marker.setAttribute('markerHeight', '4');
+        marker.setAttribute('refX', '2');
+        marker.setAttribute('refY', '2');
+        marker.setAttribute('orient', 'auto');
+        const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+        polygon.setAttribute('points', '0,0 4,2 0,4');
+        polygon.setAttribute('fill', '#3b82f6');
+        marker.appendChild(polygon);
+        defs.appendChild(marker);
+        arrowOverlay.appendChild(defs);
+        boardEl.appendChild(arrowOverlay);
+      }
+
+      function squareToCoords(sq) {
+        const file = sq.charCodeAt(0) - 97;
+        const rank = parseInt(sq[1], 10) - 1;
+        return { x: file + 0.5, y: 7 - rank + 0.5 };
+      }
+
+      function drawArrow(fromSq, toSq) {
+        ensureArrowOverlay();
+        const from = squareToCoords(fromSq);
+        const to   = squareToCoords(toSq);
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', from.x);
+        line.setAttribute('y1', from.y);
+        line.setAttribute('x2', to.x);
+        line.setAttribute('y2', to.y);
+        line.setAttribute('stroke', '#3b82f6');
+        line.setAttribute('stroke-width', '0.15');
+        line.setAttribute('stroke-linecap', 'round');
+        line.setAttribute('marker-end', 'url(#' + arrowMarkerId + ')');
+        arrowOverlay.appendChild(line);
+      }
+
+      // ==================================================================
+      //  BOARD CALLBACKS
+      // ==================================================================
+      function onDragStart(source, piece) {
+        if (game.game_over()) return false;
+        if (stockfishEnabled) {
+          const humanColor = startSideSelect.value === 'white' ? 'w' : 'b';
+          if (piece[0] !== humanColor) return false;
+          if (game.turn() !== humanColor) return false;
+        }
+        return true;
+      }
+
+      function onDrop(source, target) {
+        const move = game.move({ from: source, to: target, promotion: 'q' });
+        if (move === null) return 'snapback';
+
+        clearBestMoveHighlight();
+        bestMove = null;
+        board.position(game.fen());
+
+        if (stockfishEnabled && !game.game_over()) {
+          const engineColor = startSideSelect.value === 'white' ? 'b' : 'w';
+          if (game.turn() === engineColor) scheduleEngineMove(100);
+        }
+      }
+
+      function onSnapEnd() {
+        board.position(game.fen());
+      }
+
+      // ==================================================================
+      //  RESET  ← the only thing this bug report is really about
+      // ==================================================================
+      function resetGame() {
+        log('Resetting…');
+
+        // ---- Step 1: cancel any pending engine request ----------------
+        if (engineTimeoutId) {
+          clearTimeout(engineTimeoutId);
+          engineTimeoutId = null;
+        }
+
+        // ---- Step 2: reset game state --------------------------------
+        game = new Chess();
+        bestMove = null;
+
+        // ---- Step 3: reset the board VISUALLY — do this first, using
+        //             board.position('start') (documented API). board.start()
+        //             does NOT exist in Chessboard.js 1.0.0 and would throw.
+        if (board && typeof board.position === 'function') {
+          try {
+            board.position('start');
+          } catch (err) {
+            log('Board reset failed: ' + err.message, true);
+          }
+        }
+
+        // ---- Step 4: clear highlight (SVG + classes) -----------------
+        try { clearBestMoveHighlight(); } catch (err) { /* ignore */ }
+
+        // ---- Step 5: restart the engine (isolated in try/catch) ------
+        try {
+          stopStockfish();
+          initStockfish();
+        } catch (err) {
+          log('Stockfish restart failed: ' + err.message, true);
+        }
+
+        // ---- Step 6: if human plays black, engine (white) moves first -
+        if (stockfishEnabled && startSideSelect.value === 'black' && stockfishReady) {
+          scheduleEngineMove(200);
+        }
+
+        log('Game reset.');
+      }
+
+      // ==================================================================
+      //  UI WIRING
+      // ==================================================================
+      stockfishToggle.addEventListener('change', function (e) {
+        stockfishEnabled = e.target.checked;
+        if (!stockfishEnabled) {
+          clearBestMoveHighlight();
+          bestMove = null;
+          log('Stockfish OFF');
+        } else {
+          log('Stockfish ON');
+          if (!game.game_over()) {
+            const engineColor = startSideSelect.value === 'white' ? 'b' : 'w';
+            if (game.turn() === engineColor) scheduleEngineMove(50);
+          }
+        }
+      });
+
+      startSideSelect.addEventListener('change', resetGame);
+      resetBtn.addEventListener('click', resetGame);
+
+      // ---- Boot ------------------------------------------------------
+      try {
+        board = Chessboard('board', {
+          draggable: true,
+          position: 'start',
+          onDragStart: onDragStart,
+          onDrop: onDrop,
+          onSnapEnd: onSnapEnd,
+          pieceTheme:
+            'https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/img/chesspieces/wikipedia/{piece}.png'
+        });
+      } catch (err) {
+        log('Board failed to initialise: ' + err.message, true);
+      }
+
+      try { initStockfish(); } catch (err) { /* already logged */ }
+
+      if (stockfishEnabled && startSideSelect.value === 'black') {
+        scheduleEngineMove(500);
+      }
+    })();
+  </script>
+</body>
+</html>
